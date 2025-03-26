@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: lokiplus-api
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn src.app:app
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: SUPABASE_URL
+        value: https://nusligglyvgsmuvauyce.supabase.co
+      - key: SUPABASE_KEY
+        sync: false
+      - key: FLASK_ENV
+        value: production
+      - key: FLASK_DEBUG
+        value: "0"
+    healthCheckPath: /health
+    autoDeploy: true 

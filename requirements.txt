@@ -8,4 +8,6 @@ ordered-set==4.1.0
 supabase==2.3.5
 pytest==8.0.2
 psycopg2-binary==2.9.9
-gunicorn==21.2.0 
+gunicorn==21.2.0
+Werkzeug==3.0.1
+requests==2.31.0 

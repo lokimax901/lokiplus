@@ -1,83 +1,92 @@
-# Account Manager
+# LokiPlus
 
-A simple Flask application for managing user accounts with PostgreSQL database.
+A client management system built with Flask and Supabase.
 
 ## Features
 
-- View all accounts
-- Add new accounts
-- Update account status
-- Secure password hashing
-- Modern Bootstrap UI
+- Client Management
+  - Add, edit, and delete clients
+  - Track client renewal dates
+  - Automatic next renewal date calculation
+  - Client-account linking system
+- Account Management
+  - Secure account creation and management
+  - Status tracking (active/inactive)
+  - Client association (up to 5 clients per account)
+- Health Monitoring
+  - Real-time database health checks
+  - Route performance monitoring
+  - System status dashboard
+- Database Health Checking
+  - Automatic connection validation
+  - Performance metrics
+  - Error tracking and reporting
 
-## Prerequisites
+## Tech Stack
 
-- Python 3.8 or higher
-- PostgreSQL
-- pip (Python package manager)
+- Frontend: HTML, CSS, JavaScript
+- Backend: Flask (Python)
+- Database: Supabase (PostgreSQL)
 
-## Setup
+## Local Development
 
 1. Clone the repository:
-```bash
-git clone <repository-url>
-cd submax
-```
+   ```bash
+   git clone https://github.com/lokimax901/lokiplus.git
+   cd lokiplus
+   ```
 
-2. Create and activate a virtual environment (optional but recommended):
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-```
+2. Set up a virtual environment:
+   ```bash
+   python -m venv .venv
+   .\.venv\Scripts\activate  # Windows
+   source .venv/bin/activate  # Unix/MacOS
+   ```
 
 3. Install dependencies:
-```bash
-pip install -r requirements.txt
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. Create a `.env` file in the root directory:
+   ```
+   SUPABASE_URL=your_supabase_url
+   SUPABASE_KEY=your_supabase_key
+   FLASK_ENV=development
+   FLASK_DEBUG=1
+   ```
+
+5. Run the application:
+   ```bash
+   python src/app.py
+   ```
+
+## Deployment
+
+### Frontend (Netlify)
+The frontend is deployed on Netlify. Visit [https://lokiplus.netlify.app](https://lokiplus.netlify.app) to access the application.
+
+### Backend (Render)
+The backend API is deployed on Render. The API endpoint is:
+```
+https://lokiplus-api.onrender.com
 ```
 
-4. Configure environment variables:
-   - Copy `.env.example` to `.env`
-   - Update the database credentials and secret key in `.env`
+### Environment Variables
+Make sure to set the following environment variables in your deployment platform:
+- `SUPABASE_URL`: Your Supabase project URL
+- `SUPABASE_KEY`: Your Supabase project API key
+- `FLASK_ENV`: Set to "production"
+- `FLASK_DEBUG`: Set to "0"
 
-5. Initialize the database:
-   - Make sure PostgreSQL is running
-   - The application will automatically create the database and tables on first run
+## Contributing
 
-## Running the Application
-
-1. Start the Flask development server:
-```bash
-python src/app.py
-```
-
-2. Open your browser and navigate to:
-```
-http://localhost:5000
-```
-
-## Project Structure
-
-```
-submax/
-├── src/
-│   ├── app.py              # Main application file
-│   ├── templates/          # HTML templates
-│   │   └── index.html     # Main page template
-│   ├── static/            # Static files (CSS, JS)
-│   └── database/          # Database scripts
-│       └── schema.sql     # Database schema
-├── requirements.txt       # Python dependencies
-├── .env                  # Environment variables
-└── README.md            # This file
-```
-
-## Security Notes
-
-- Passwords are hashed using bcrypt
-- Environment variables are used for sensitive data
-- Flash messages auto-dismiss after 5 seconds
-- Input validation is performed on all forms
+1. Fork the repository
+2. Create a feature branch
+3. Commit your changes
+4. Push to the branch
+5. Create a Pull Request
 
 ## License
 
-MIT License 
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details. 

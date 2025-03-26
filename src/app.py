@@ -29,9 +29,22 @@ limiter = Limiter(
 
 # Health check endpoints
 @app.route('/health')
-def health():
-    """Get overall application health status"""
-    return jsonify(health_checker.check_application())
+def health_check():
+    """Health check endpoint for Render."""
+    try:
+        # Check database connection
+        supabase.table('accounts').select('id').limit(1).execute()
+        return jsonify({
+            'status': 'healthy',
+            'timestamp': datetime.utcnow().isoformat(),
+            'database': 'connected'
+        }), 200
+    except Exception as e:
+        return jsonify({
+            'status': 'unhealthy',
+            'timestamp': datetime.utcnow().isoformat(),
+            'error': str(e)
+        }), 500
 
 @app.route('/health/database')
 def database_health():
