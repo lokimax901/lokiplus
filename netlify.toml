@@ -1,6 +1,6 @@
 [build]
   command = "python build.py"
-  publish = "src/static"
+  publish = "build"
 
 [[redirects]]
   from = "/*"
