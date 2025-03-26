@@ -2,45 +2,65 @@ import os
 import shutil
 from pathlib import Path
 
+def safe_copy(src, dst):
+    """Safely copy a file, creating parent directories if needed."""
+    try:
+        # Create parent directories if they don't exist
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Only copy if source and destination are different
+        if src != dst and src.exists():
+            shutil.copy2(src, dst)
+            print(f"Copied {src.name} to {dst.parent}")
+    except Exception as e:
+        print(f"Error copying {src.name}: {str(e)}")
+
+def clean_directory(directory):
+    """Clean a directory without deleting the directory itself."""
+    if directory.exists():
+        for item in directory.iterdir():
+            if item.is_file():
+                item.unlink()
+            elif item.is_dir():
+                shutil.rmtree(item)
+        print(f"Cleaned directory: {directory}")
+
 def build_static_files():
     """Build and organize static files for production."""
-    # Create static directory if it doesn't exist
+    # Setup directories
+    build_dir = Path('build')
     static_dir = Path('static')
-    static_dir.mkdir(exist_ok=True)
-    
-    # Copy template files to static directory
     template_dir = Path('templates')
+    
+    # Clean and recreate build directory
+    if build_dir.exists():
+        clean_directory(build_dir)
+    else:
+        build_dir.mkdir(exist_ok=True)
+    print("Prepared build directory")
+    
+    # Copy template files to build directory
     if template_dir.exists():
         for template in template_dir.glob('*.html'):
-            shutil.copy2(template, static_dir / template.name)
-            print(f"Copied {template.name} to static directory")
+            safe_copy(template, build_dir / template.name)
     
-    # Copy static assets
-    static_src = Path('static')
-    if static_src.exists():
+    # Copy static assets if they exist
+    if static_dir.exists():
         # Copy CSS files
-        css_dir = static_dir / 'css'
-        css_dir.mkdir(exist_ok=True)
-        for css in static_src.glob('css/*.css'):
-            shutil.copy2(css, css_dir / css.name)
-            print(f"Copied {css.name} to static/css")
+        for css in static_dir.glob('css/*.css'):
+            safe_copy(css, build_dir / 'css' / css.name)
         
         # Copy JavaScript files
-        js_dir = static_dir / 'js'
-        js_dir.mkdir(exist_ok=True)
-        for js in static_src.glob('js/*.js'):
-            shutil.copy2(js, js_dir / js.name)
-            print(f"Copied {js.name} to static/js")
+        for js in static_dir.glob('js/*.js'):
+            safe_copy(js, build_dir / 'js' / js.name)
         
         # Copy images
-        img_dir = static_dir / 'img'
-        img_dir.mkdir(exist_ok=True)
-        for img in static_src.glob('img/*'):
-            shutil.copy2(img, img_dir / img.name)
-            print(f"Copied {img.name} to static/img")
+        for img in static_dir.glob('img/*'):
+            safe_copy(img, build_dir / 'img' / img.name)
     
     # Create a simple 404 page
-    with open(static_dir / '404.html', 'w') as f:
+    not_found_page = build_dir / '404.html'
+    with open(not_found_page, 'w') as f:
         f.write("""
 <!DOCTYPE html>
 <html>
@@ -64,7 +84,25 @@ def build_static_files():
         """.strip())
     print("Created 404.html")
     
-    print("Static build completed successfully!")
+    # Clean and prepare static directory for final output
+    if static_dir.exists():
+        clean_directory(static_dir)
+    else:
+        static_dir.mkdir(exist_ok=True)
+    
+    # Move everything from build to static
+    for item in build_dir.iterdir():
+        if item.is_file():
+            safe_copy(item, static_dir / item.name)
+        elif item.is_dir():
+            for file in item.rglob('*'):
+                if file.is_file():
+                    relative_path = file.relative_to(build_dir)
+                    safe_copy(file, static_dir / relative_path)
+    
+    # Clean up build directory
+    shutil.rmtree(build_dir)
+    print("Build completed successfully!")
 
 if __name__ == '__main__':
     build_static_files() 
