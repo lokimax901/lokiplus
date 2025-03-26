@@ -6,12 +6,13 @@ from dotenv import load_dotenv
 import logging
 from datetime import datetime
 import re
-from config import Config
+from config import Config, supabase
 from db import DatabasePool
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from route_manager import route_manager
 from health_checker import health_checker
+from flask_cors import CORS
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -19,6 +20,19 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.secret_key = Config.SECRET_KEY
+
+# Configure CORS
+CORS(app, resources={
+    r"/*": {
+        "origins": [
+            "https://lokiplus.netlify.app",
+            "http://localhost:5000",
+            "http://127.0.0.1:5000"
+        ],
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"]
+    }
+})
 
 # Initialize rate limiter
 limiter = Limiter(

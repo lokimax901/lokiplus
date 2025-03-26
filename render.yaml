@@ -7,13 +7,13 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
-      - key: SUPABASE_URL
-        value: https://nusligglyvgsmuvauyce.supabase.co
-      - key: SUPABASE_KEY
-        sync: false
       - key: FLASK_ENV
         value: production
       - key: FLASK_DEBUG
-        value: "0"
+        value: 0
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
     healthCheckPath: /health
     autoDeploy: true 
