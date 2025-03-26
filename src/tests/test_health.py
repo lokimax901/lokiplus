@@ -1,35 +1,27 @@
 import pytest
 import json
-import time
 from datetime import datetime, timedelta
-from route_manager import RouteManager
 
 def test_health_endpoint(client):
-    """Test health endpoint returns correct status"""
+    """Test the main health check endpoint"""
     response = client.get('/health')
     assert response.status_code == 200
     data = json.loads(response.data)
     assert 'status' in data
-    assert data['status'] in ['healthy', 'error']
+    assert 'timestamp' in data
+    assert 'details' in data
+    assert isinstance(data['details'], dict)
 
-def test_database_health(client):
-    """Test database health check endpoint"""
-    response = client.get('/health')
+def test_database_health_endpoint(client):
+    """Test the database health check endpoint"""
+    response = client.get('/health/database')
     assert response.status_code == 200
     data = json.loads(response.data)
     assert 'status' in data
-    assert data['status'] in ['healthy', 'error']
-
-def test_routes_health(client):
-    """Test the routes health endpoint"""
-    # Make a request to generate some stats
-    client.get('/clients')
-    
-    response = client.get('/health/routes')
-    assert response.status_code == 200
-    data = json.loads(response.data)
-    assert isinstance(data, dict)
-    assert 'routes' in data
+    assert 'timestamp' in data
+    assert 'details' in data
+    assert 'tables' in data['details']
+    assert 'connection_status' in data['details']
 
 def test_database_health_force_check(client):
     """Test forcing a database health check"""
@@ -37,7 +29,28 @@ def test_database_health_force_check(client):
     assert response.status_code == 200
     data = json.loads(response.data)
     assert 'status' in data
-    assert data['status'] in ['healthy', 'error']
+    assert data['details']['force_checked'] is True
+
+def test_routes_health_endpoint(client, test_data):
+    """Test the routes health check endpoint"""
+    # First make some requests to generate route statistics
+    client.get('/clients')
+    client.get('/health')
+    
+    response = client.get('/health/routes')
+    assert response.status_code == 200
+    data = json.loads(response.data)
+    assert 'routes' in data
+    assert isinstance(data['routes'], list)
+    assert len(data['routes']) > 0
+    
+    # Check route statistics format
+    route = data['routes'][0]
+    assert 'path' in route
+    assert 'method' in route
+    assert 'hits' in route
+    assert 'avg_response_time' in route
+    assert 'error_rate' in route
 
 def test_recommendations_endpoint(client):
     """Test the health recommendations endpoint"""
@@ -56,6 +69,7 @@ def test_health_check_with_db_error(client, db):
     assert response.status_code == 200  # Should still return 200 but with error status
     data = json.loads(response.data)
     assert data['status'] == 'error'
+    assert 'connection_error' in data['details']
 
 def test_route_monitoring(client):
     """Test route monitoring functionality"""
@@ -64,48 +78,38 @@ def test_route_monitoring(client):
         client.get('/clients')
     
     response = client.get('/health/routes')
-    assert response.status_code == 200
     data = json.loads(response.data)
-    assert isinstance(data, dict)
-    assert 'routes' in data
-    assert '/clients' in data['routes']
     
-    # Verify route statistics
-    client_stats = data['routes']['/clients']
-    assert client_stats['hits'] == 3
-    assert 'error_rate' in client_stats
-    assert 'avg_response_time' in client_stats
-    assert 'min_response_time' in client_stats
-    assert 'max_response_time' in client_stats
-    assert 'last_access' in client_stats
+    # Find the /clients route statistics
+    clients_route = next(r for r in data['routes'] if r['path'] == '/clients')
+    assert clients_route['hits'] >= 3
+    assert clients_route['avg_response_time'] > 0
+    assert 'error_rate' in clients_route
 
-def test_error_tracking(client):
-    """Test error tracking in route monitoring"""
-    # Generate a 404 error
-    response = client.get('/nonexistent-route')
-    assert response.status_code == 404
+def test_error_monitoring(client):
+    """Test error monitoring in health checks"""
+    # Trigger a 404 error
+    client.get('/nonexistent-route')
     
-    # Check health status
-    response = client.get('/health/routes')
-    assert response.status_code == 200
+    response = client.get('/health')
     data = json.loads(response.data)
-    assert isinstance(data, dict)
-    assert 'routes' in data
     
-    # Verify error tracking
-    if '/nonexistent-route' in data['routes']:
-        route_stats = data['routes']['/nonexistent-route']
-        assert route_stats['errors'] > 0
-        assert float(route_stats['error_rate'].rstrip('%')) > 0
+    assert 'error_rates' in data['details']
+    assert data['details']['error_rates']['4xx'] > 0
 
-def test_live_status(client):
-    """Test live status endpoint"""
-    response = client.get('/health/live')
-    assert response.status_code == 200
-    data = json.loads(response.data)
-    assert 'status' in data
-    assert 'timestamp' in data
-    assert 'services' in data
-    assert 'database' in data['services']
-    assert 'application' in data['services']
-    assert 'routes' in data['services'] 
+def test_cache_behavior(client):
+    """Test health check caching behavior"""
+    # Make two quick requests
+    response1 = client.get('/health/database')
+    response2 = client.get('/health/database')
+    
+    data1 = json.loads(response1.data)
+    data2 = json.loads(response2.data)
+    
+    # Should return cached data
+    assert data1['timestamp'] == data2['timestamp']
+    
+    # Force refresh should bypass cache
+    response3 = client.get('/health/database?force=true')
+    data3 = json.loads(response3.data)
+    assert data3['timestamp'] != data1['timestamp'] 

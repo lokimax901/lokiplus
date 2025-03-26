@@ -9,10 +9,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class RouteManager:
-    def __init__(self, app=None):
-        self.app = app
+    def __init__(self):
         self.routes = {}
-        self.route_stats = {}  # Store route statistics
         self.start_time = datetime.now()
 
     def monitor(self, route=None, required_params=None, description=None):
@@ -25,15 +23,9 @@ class RouteManager:
                 'required_params': required_params or {},
                 'status': 'healthy',
                 'last_check': None,
-                'path': route or f.__name__
-            }
-            self.route_stats[endpoint] = {
-                'hits': 0,
-                'errors': 0,
-                'total_response_time': 0,
-                'min_response_time': float('inf'),
-                'max_response_time': 0,
-                'last_access': None
+                'total_calls': 0,
+                'failed_calls': 0,
+                'avg_response_time': 0
             }
 
             @wraps(f)
@@ -81,15 +73,13 @@ class RouteManager:
                     result = f(*args, **kwargs)
                     
                     # Update statistics
+                    self.routes[endpoint]['total_calls'] += 1
                     response_time = time.time() - start_time
-                    stats = self.route_stats[endpoint]
-                    stats['hits'] += 1
-                    stats['total_response_time'] += response_time
-                    stats['min_response_time'] = min(stats['min_response_time'], response_time)
-                    stats['max_response_time'] = max(stats['max_response_time'], response_time)
-                    stats['last_access'] = datetime.now()
-                    
-                    # Update route health
+                    avg_time = self.routes[endpoint]['avg_response_time']
+                    self.routes[endpoint]['avg_response_time'] = (
+                        (avg_time * (self.routes[endpoint]['total_calls'] - 1) + response_time) /
+                        self.routes[endpoint]['total_calls']
+                    )
                     self.routes[endpoint]['status'] = 'healthy'
                     self.routes[endpoint]['last_check'] = datetime.now()
                     
@@ -97,7 +87,7 @@ class RouteManager:
                     
                 except Exception as e:
                     # Update error statistics
-                    self.route_stats[endpoint]['errors'] += 1
+                    self.routes[endpoint]['failed_calls'] += 1
                     self.routes[endpoint]['status'] = 'unhealthy'
                     self.routes[endpoint]['last_error'] = str(e)
                     self.routes[endpoint]['last_check'] = datetime.now()
@@ -108,47 +98,25 @@ class RouteManager:
         return decorator
 
     def generate_report(self):
-        """Generate a report of route statistics"""
+        """Generate a report of all routes and their health status"""
         try:
-            report = {'routes': []}
-            for endpoint, stats in self.route_stats.items():
-                hits = stats.get('hits', 0)
-                errors = stats.get('errors', 0)
-                total_time = stats.get('total_response_time', 0)
-                
-                # Calculate error rate and average response time
-                error_rate = (errors / hits * 100) if hits > 0 else 0
-                avg_response_time = (total_time / hits) if hits > 0 else 0
-                
-                # Get the route path from the routes dictionary
-                route_info = {
-                    'endpoint': endpoint,
-                    'path': self.routes[endpoint]['path'],
-                    'method': request.method if request else 'GET',
-                    'hits': hits,
-                    'errors': errors,
-                    'avg_response_time': f"{avg_response_time:.3f}s",
-                    'error_rate': f"{error_rate:.2f}%",
-                    'last_error': self.routes[endpoint].get('last_error'),
-                    'status': 'healthy' if error_rate < 5 else 'degraded',
-                    'last_check': self.routes[endpoint].get('last_check')
-                }
-                report['routes'].append(route_info)
-            return report
+            total_routes = len(self.routes)
+            healthy_routes = sum(1 for r in self.routes.values() if r['status'] == 'healthy')
+            
+            return {
+                'status': 'healthy' if healthy_routes == total_routes else 'degraded',
+                'total': total_routes,
+                'healthy': healthy_routes,
+                'routes': self.routes
+            }
         except Exception as e:
             logger.error(f"Error generating route report: {e}")
-            return {'routes': []}
-
-    def reset_stats(self):
-        """Reset all route statistics"""
-        for endpoint in self.route_stats:
-            self.route_stats[endpoint] = {
-                'hits': 0,
-                'errors': 0,
-                'total_response_time': 0,
-                'min_response_time': float('inf'),
-                'max_response_time': 0,
-                'last_access': None
+            return {
+                'status': 'error',
+                'error': str(e),
+                'total': 0,
+                'healthy': 0,
+                'routes': {}
             }
 
 # Create a global instance

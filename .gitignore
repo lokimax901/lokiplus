@@ -35,12 +35,13 @@ ENV/
 
 # Logs
 *.log
-logs/
 
-# Database
-*.sqlite3
-*.db
-
-# OS
+# Local development
 .DS_Store
-Thumbs.db 
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Netlify
+.netlify/ 

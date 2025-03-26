@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, flash, redirect, url_for, jsonify, current_app, g, session
+from flask import Flask, render_template, request, flash, redirect, url_for, jsonify
 import psycopg2
 import bcrypt
 import os
@@ -6,60 +6,19 @@ from dotenv import load_dotenv
 import logging
 from datetime import datetime
 import re
-import uuid
-from functools import wraps
 from config import Config
 from db import DatabasePool
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from route_manager import route_manager
 from health_checker import health_checker
-from psycopg2 import pool
 
-# Initialize Flask app
-app = Flask(__name__)
-app.secret_key = Config.SECRET_KEY
-app.config.from_object(Config)
-
-# Configure logging with request ID
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)8s] [%(request_id)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
+# Configure logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class RequestIDFilter(logging.Filter):
-    def filter(self, record):
-        try:
-            record.request_id = getattr(g, 'request_id', 'NO-REQ-ID')
-        except RuntimeError:
-            record.request_id = 'NO-CTX'
-        return True
-
-logger.addFilter(RequestIDFilter())
-
-def login_required(f):
-    """Decorator to require login for routes"""
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if 'admin_id' not in session:
-            flash('Please log in to access this page', 'warning')
-            return redirect(url_for('admin_login'))
-        return f(*args, **kwargs)
-    return decorated_function
-
-@app.before_request
-def before_request():
-    """Add request ID to each request"""
-    g.request_id = str(uuid.uuid4())
-    logger.info(f"Request started: {request.method} {request.path}")
-
-@app.after_request
-def after_request(response):
-    """Log request completion"""
-    logger.info(f"Request completed: {response.status}")
-    return response
+app = Flask(__name__)
+app.secret_key = Config.SECRET_KEY
 
 # Initialize rate limiter
 limiter = Limiter(
@@ -67,26 +26,6 @@ limiter = Limiter(
     key_func=get_remote_address,
     default_limits=["200 per day", "50 per hour"]
 )
-
-# Create a connection pool
-db_pool = pool.SimpleConnectionPool(
-    1,  # minconn
-    20,  # maxconn
-    **Config.DB_CONFIG
-)
-
-def get_db():
-    """Get a database connection from the pool"""
-    if 'db' not in g:
-        g.db = db_pool.getconn()
-    return g.db
-
-@app.teardown_appcontext
-def close_db_pool(error):
-    """Close the database pool when the app context ends"""
-    db = g.pop('db', None)
-    if db is not None:
-        db_pool.putconn(db)
 
 # Health check endpoints
 @app.route('/health')
@@ -97,7 +36,8 @@ def health():
 @app.route('/health/database')
 def database_health():
     """Get database health status"""
-    return jsonify(health_checker.check_database())
+    force_check = request.args.get('force', '').lower() == 'true'
+    return jsonify(health_checker.check_database(force=force_check))
 
 @app.route('/health/routes')
 def route_health():
@@ -138,7 +78,7 @@ def live_status():
                 },
                 'routes': {
                     'total': len(route_stats['routes']),
-                    'healthy': sum(1 for r in route_stats['routes'] if r['status'] == 'healthy')
+                    'healthy': sum(1 for r in route_stats['routes'].values() if r['status'] == 'healthy')
                 }
             }
         }
@@ -163,6 +103,21 @@ def check_db_connection():
     except Exception as e:
         logger.error(f"Unexpected database error: {e}")
         health_checker.check_database(force=True)  # Force update health status
+        raise
+
+def get_db():
+    """Get database connection from pool"""
+    try:
+        conn = psycopg2.connect(
+            dbname=Config.DB_CONFIG['database'],
+            user=Config.DB_CONFIG['user'],
+            password=Config.DB_CONFIG['password'],
+            host=Config.DB_CONFIG['host'],
+            port=Config.DB_CONFIG['port']
+        )
+        return conn
+    except Exception as e:
+        logger.error(f"Database connection error: {e}")
         raise
 
 def verify_table_structure(cur, table_name):
@@ -294,111 +249,7 @@ def validate_password(password):
         return False, "Password must contain at least one number"
     return True, "Password is valid"
 
-# Admin authentication routes
-@app.route('/admin/login', methods=['GET', 'POST'])
-@limiter.limit("5 per minute")
-@route_manager.monitor(
-    route='/admin/login',
-    description="Admin login page"
-)
-def admin_login():
-    """Handle admin login"""
-    if request.method == 'POST':
-        username = request.form.get('username')
-        password = request.form.get('password')
-        
-        if not username or not password:
-            flash('Please provide both username and password', 'danger')
-            return redirect(url_for('admin_login'))
-            
-        try:
-            conn = get_db()
-            cur = conn.cursor()
-            
-            # Get admin user
-            cur.execute("""
-                SELECT id, username, password, is_active
-                FROM admin_users
-                WHERE username = %s
-            """, (username,))
-            
-            admin = cur.fetchone()
-            
-            if admin and admin[3]:  # Check if user exists and is active
-                if bcrypt.checkpw(password.encode('utf-8'), admin[2].encode('utf-8')):
-                    # Update last login
-                    cur.execute("""
-                        UPDATE admin_users
-                        SET last_login = CURRENT_TIMESTAMP
-                        WHERE id = %s
-                    """, (admin[0],))
-                    conn.commit()
-                    
-                    # Set session
-                    session['admin_id'] = admin[0]
-                    session['admin_username'] = admin[1]
-                    
-                    flash('Login successful', 'success')
-                    return redirect(url_for('index'))
-                else:
-                    flash('Invalid password', 'danger')
-            else:
-                flash('Invalid username or account is inactive', 'danger')
-                
-        except Exception as e:
-            logger.error(f"Login error: {e}")
-            flash('An error occurred during login', 'danger')
-        finally:
-            if 'cur' in locals():
-                cur.close()
-                
-    return render_template('login.html')
-
-@app.route('/admin/logout')
-@route_manager.monitor(
-    route='/admin/logout',
-    description="Admin logout"
-)
-def admin_logout():
-    """Handle admin logout"""
-    session.clear()
-    flash('You have been logged out', 'info')
-    return redirect(url_for('admin_login'))
-
-# Create default admin user if not exists
-def create_default_admin():
-    """Create default admin user if none exists"""
-    try:
-        conn = get_db()
-        cur = conn.cursor()
-        
-        # Check if any admin users exist
-        cur.execute("SELECT COUNT(*) FROM admin_users")
-        if cur.fetchone()[0] == 0:
-            # Create default admin
-            username = os.getenv('ADMIN_USERNAME', 'admin')
-            password = os.getenv('ADMIN_PASSWORD', 'admin123')
-            email = os.getenv('ADMIN_EMAIL', 'admin@example.com')
-            
-            hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-            
-            cur.execute("""
-                INSERT INTO admin_users (username, password, email)
-                VALUES (%s, %s, %s)
-            """, (username, hashed_password, email))
-            
-            conn.commit()
-            logger.info("Created default admin user")
-            
-    except Exception as e:
-        logger.error(f"Error creating default admin: {e}")
-    finally:
-        if 'cur' in locals():
-            cur.close()
-
-# Protect all routes with login_required
 @app.route('/')
-@login_required
 @route_manager.monitor(
     route='/',
     description="Main page displaying accounts and clients"
@@ -440,7 +291,6 @@ def index():
             conn.close()
 
 @app.route('/add_account', methods=['POST'])
-@login_required
 @limiter.limit("5 per minute")
 @route_manager.monitor(
     route='/add_account',
@@ -455,50 +305,55 @@ def index():
 )
 def add_account():
     """Add a new account"""
+    conn = None
     try:
-        email = request.form['email']
-        password = request.form['password']
+        email = request.form.get('email')
+        password = request.form.get('password')
         status = request.form.get('status', 'active')
-
-        # Validate email and password
+        
+        if not email or not password:
+            flash('Email and password are required', 'danger')
+            return redirect(url_for('index'))
+        
+        # Validate email format
         if not validate_email(email):
-            flash('Invalid email format', 'error')
+            flash('Invalid email format', 'danger')
             return redirect(url_for('index'))
-
-        if not validate_password(password):
-            flash('Password must be at least 8 characters long and contain letters, numbers, and special characters', 'error')
+        
+        # Validate password strength
+        is_valid, message = validate_password(password)
+        if not is_valid:
+            flash(message, 'danger')
             return redirect(url_for('index'))
-
-        # Hash password
-        hashed_password = hash_password(password)
-
-        # Add account to database
+        
         conn = get_db()
         cur = conn.cursor()
         
         # Check if email already exists
-        cur.execute("SELECT id FROM accounts WHERE email = %s", (email,))
+        cur.execute('SELECT id FROM accounts WHERE email = %s', (email,))
         if cur.fetchone():
-            flash('Email already exists', 'error')
+            flash('Email already exists', 'danger')
             return redirect(url_for('index'))
-
-        # Insert new account
-        cur.execute("""
-            INSERT INTO accounts (email, password, status)
-            VALUES (%s, %s, %s)
-            RETURNING id
-        """, (email, hashed_password, status))
         
-        account_id = cur.fetchone()[0]
+        # Hash password and insert account
+        hashed_password = hash_password(password)
+        cur.execute(
+            'INSERT INTO accounts (email, password, status) VALUES (%s, %s, %s)',
+            (email, hashed_password, status)
+        )
         conn.commit()
-        
         flash('Account added successfully', 'success')
-        return redirect(url_for('index'))
         
     except Exception as e:
         logger.error(f"Error adding account: {e}")
-        flash('Error adding account', 'error')
-        return redirect(url_for('index'))
+        flash('Error adding account', 'danger')
+    finally:
+        if 'cur' in locals():
+            cur.close()
+        if conn:
+            conn.close()
+    
+    return redirect(url_for('index'))
 
 @app.route('/update_status', methods=['POST'])
 @limiter.limit("10 per minute")
@@ -514,49 +369,52 @@ def add_account():
 )
 def update_status():
     """Update account status"""
+    conn = None
     try:
-        account_id = request.form['account_id']
-        status = request.form['status']
-
+        account_id = request.form.get('account_id')
+        new_status = request.form.get('status')
+        
+        if not account_id or not new_status:
+            flash('Account ID and status are required', 'danger')
+            return redirect(url_for('index'))
+        
         conn = get_db()
         cur = conn.cursor()
         
-        # Update account status
-        cur.execute("""
-            UPDATE accounts 
-            SET status = %s, updated_at = CURRENT_TIMESTAMP 
-            WHERE id = %s
-        """, (status, account_id))
-        
-        if cur.rowcount == 0:
-            flash('Account not found', 'error')
-            return redirect(url_for('index'))
-            
+        cur.execute(
+            'UPDATE accounts SET status = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s',
+            (new_status, account_id)
+        )
         conn.commit()
         flash('Status updated successfully', 'success')
-        return redirect(url_for('index'))
         
     except Exception as e:
         logger.error(f"Error updating status: {e}")
-        flash('Error updating status', 'error')
-        return redirect(url_for('index'))
+        flash('Error updating status', 'danger')
+    finally:
+        if 'cur' in locals():
+            cur.close()
+        if conn:
+            conn.close()
+    
+    return redirect(url_for('index'))
 
 @app.route('/check_client', methods=['POST'])
 @route_manager.monitor(
     route='/check_client',
     required_params={
         'POST': {
-            'client_id': str
+            'email': str
         }
     },
     description="Check if a client exists"
 )
 def check_client():
-    """Check if a client with the given ID exists"""
+    """Check if a client with the given email already exists"""
     conn = None
     try:
-        client_id = request.form.get('client_id')
-        if not client_id:
+        email = request.form.get('email')
+        if not email:
             return {'exists': False}
         
         conn = get_db()
@@ -565,8 +423,8 @@ def check_client():
         cur.execute('''
             SELECT id, name, email, phone, renewal_date
             FROM clients
-            WHERE id = %s
-        ''', (client_id,))
+            WHERE email = %s
+        ''', (email,))
         
         client = cur.fetchone()
         if client:
@@ -592,49 +450,108 @@ def check_client():
             conn.close()
 
 @app.route('/add_client', methods=['POST'])
+@limiter.limit("5 per minute")
+@route_manager.monitor(
+    route='/add_client',
+    required_params={
+        'POST': {
+            'name': str,
+            'email': str
+        }
+    },
+    description="Add a new client"
+)
 def add_client():
     """Add a new client"""
+    conn = None
     try:
-        name = request.form['name']
-        email = request.form['email']
-        phone = request.form['phone']
+        name = request.form.get('name')
+        email = request.form.get('email')
+        phone = request.form.get('phone')
         renewal_date = request.form.get('renewal_date')
-        account_id = request.form.get('account_id')
-
+        force_add = request.form.get('force_add') == 'true'
+        
         logger.info(f"Attempting to add client - Name: {name}, Email: {email}, Phone: {phone}, Renewal: {renewal_date}")
-
-        # Validate email
+        
+        # Validate required fields
+        if not name or not name.strip():
+            flash('Client name is required', 'danger')
+            return redirect(url_for('index'))
+            
+        if not email or not email.strip():
+            flash('Email is required', 'danger')
+            return redirect(url_for('index'))
+        
+        # Validate email format
         if not validate_email(email):
-            flash('Invalid email format', 'error')
-            return redirect(url_for('get_clients'))
-
-        conn = get_db()
+            flash('Invalid email format', 'danger')
+            return redirect(url_for('index'))
+        
+        # Clean and validate phone number if provided
+        if phone:
+            phone = phone.strip()
+            if not re.match(r'^\+?1?\d{9,15}$', phone):
+                flash('Invalid phone number format. Please use numbers only, optionally with country code.', 'danger')
+                return redirect(url_for('index'))
+        
+        # Validate renewal date if provided
+        if renewal_date:
+            try:
+                # Ensure the date is in YYYY-MM-DD format
+                renewal_date = datetime.strptime(renewal_date, '%Y-%m-%d').date()
+            except ValueError as e:
+                logger.error(f"Date parsing error: {e}")
+                flash('Invalid renewal date format. Please use YYYY-MM-DD format.', 'danger')
+                return redirect(url_for('index'))
+        
+        conn = check_db_connection()  # Use the connection checker instead
         cur = conn.cursor()
-
+        
         # Check if email already exists
-        cur.execute("SELECT id FROM clients WHERE email = %s", (email,))
-        if cur.fetchone():
-            flash('Email already exists', 'error')
-            return redirect(url_for('get_clients'))
-
+        cur.execute('SELECT id FROM clients WHERE email = %s', (email,))
+        if cur.fetchone() and not force_add:
+            flash('Email already exists', 'danger')
+            return redirect(url_for('index'))
+        
         # Insert new client
-        cur.execute("""
-            INSERT INTO clients (name, email, phone, renewal_date, account_id)
-            VALUES (%s, %s, %s, %s, %s)
-            RETURNING id
-        """, (name, email, phone, renewal_date, account_id))
-        
-        client_id = cur.fetchone()[0]
-        logger.info(f"Successfully added client with ID: {client_id}")
-        
-        conn.commit()
-        flash('Client added successfully', 'success')
-        return redirect(url_for('get_clients'))
-
+        try:
+            logger.info("Executing client insert query...")
+            cur.execute(
+                'INSERT INTO clients (name, email, phone, renewal_date) VALUES (%s, %s, %s, %s) RETURNING id',
+                (name.strip(), email.strip(), phone, renewal_date)
+            )
+            new_client_id = cur.fetchone()[0]
+            conn.commit()
+            logger.info(f"Successfully added client with ID: {new_client_id}")
+            flash(f'Client {name} added successfully', 'success')
+            
+        except psycopg2.IntegrityError as e:
+            conn.rollback()
+            logger.error(f"Database integrity error: {e}")
+            if 'unique constraint' in str(e).lower():
+                flash('A client with this email already exists', 'danger')
+            else:
+                flash('Error adding client: database constraint violation', 'danger')
+            return redirect(url_for('index'))
+            
+        except psycopg2.Error as e:
+            conn.rollback()
+            logger.error(f"Database error adding client: {e}")
+            flash('Error adding client: database error', 'danger')
+            return redirect(url_for('index'))
+            
     except Exception as e:
-        logger.error(f"Error adding client: {e}")
-        flash('Error adding client', 'error')
-        return redirect(url_for('get_clients'))
+        logger.error(f"Unexpected error adding client: {e}", exc_info=True)
+        flash(f'Error adding client: {str(e)}', 'danger')
+        if conn:
+            conn.rollback()
+    finally:
+        if 'cur' in locals():
+            cur.close()
+        if conn:
+            conn.close()
+    
+    return redirect(url_for('index'))
 
 @app.route('/link_client', methods=['POST'])
 @limiter.limit("5 per minute")
@@ -757,16 +674,24 @@ def unlink_client():
 )
 def get_account_clients(account_id):
     """Get all clients linked to an account"""
+    conn = None
     try:
         conn = get_db()
         cur = conn.cursor()
         
-        # Get clients for account
-        cur.execute("""
+        # First check if the account exists
+        cur.execute('SELECT id FROM accounts WHERE id = %s', (account_id,))
+        if not cur.fetchone():
+            return {'error': 'Account not found'}, 404
+        
+        # Get all clients linked to this account
+        cur.execute('''
             SELECT c.id, c.name, c.email, c.phone, c.renewal_date
             FROM clients c
-            WHERE c.account_id = %s
-        """, (account_id,))
+            JOIN client_accounts ca ON c.id = ca.client_id
+            WHERE ca.account_id = %s
+            ORDER BY c.name
+        ''', (account_id,))
         
         clients = []
         for row in cur.fetchall():
@@ -775,71 +700,128 @@ def get_account_clients(account_id):
                 'name': row[1],
                 'email': row[2],
                 'phone': row[3],
-                'renewal_date': row[4].isoformat() if row[4] else None
+                'renewal_date': row[4].strftime('%Y-%m-%d') if row[4] else None
             })
-            
-        return jsonify(clients)
+        
+        return {'clients': clients}
         
     except Exception as e:
-        logger.error(f"Error getting account clients: {e}")
-        return jsonify({'error': 'Error getting clients'}), 500
+        logger.error(f"Error fetching account clients: {e}")
+        return {'error': str(e)}, 500
+    finally:
+        if 'cur' in locals():
+            cur.close()
+        if conn:
+            conn.close()
 
 @app.route('/renew_client', methods=['POST'])
+@limiter.limit("5 per minute")
+@route_manager.monitor(
+    route='/renew_client',
+    required_params={
+        'POST': {
+            'client_id': str,
+            'renewal_date': str
+        }
+    },
+    description="Renew a client's account"
+)
 def renew_client():
-    """Renew a client's subscription"""
+    """Renew a client's account"""
+    conn = None
     try:
-        client_id = request.form['client_id']
-        renewal_date = request.form['renewal_date']
+        # Try to get data from both JSON and form data
+        if request.is_json:
+            data = request.get_json()
+        else:
+            data = request.form
 
-        # Validate renewal date
+        client_id = data.get('client_id')
+        renewal_date = data.get('renewal_date')
+        
+        # Validate required parameters
+        if not client_id:
+            error_msg = 'Client ID is required'
+            logger.error(f"Renew client error: {error_msg}")
+            return jsonify({'success': False, 'error': error_msg}), 400
+            
+        if not renewal_date:
+            error_msg = 'Renewal date is required'
+            logger.error(f"Renew client error: {error_msg}")
+            return jsonify({'success': False, 'error': error_msg}), 400
+            
+        # Convert client_id to integer
         try:
-            datetime.strptime(renewal_date, '%Y-%m-%d')
+            client_id = int(client_id)
         except ValueError:
-            flash('Invalid date format. Use YYYY-MM-DD', 'error')
-            return redirect(url_for('get_clients'))
-
-        conn = get_db()
+            error_msg = 'Invalid client ID format'
+            logger.error(f"Renew client error: {error_msg}")
+            return jsonify({'success': False, 'error': error_msg}), 400
+            
+        # Validate renewal date format
+        try:
+            # Parse and format the date to ensure it's valid
+            parsed_date = datetime.strptime(renewal_date, '%Y-%m-%d').date()
+            formatted_date = parsed_date.strftime('%Y-%m-%d')
+        except ValueError as e:
+            error_msg = 'Invalid date format. Please use YYYY-MM-DD'
+            logger.error(f"Renew client error: {error_msg} - {str(e)}")
+            return jsonify({'success': False, 'error': error_msg}), 400
+        
+        conn = check_db_connection()
         cur = conn.cursor()
-
-        # Update client renewal date
-        cur.execute("""
+        
+        # First check if client exists
+        cur.execute('SELECT id FROM clients WHERE id = %s', (client_id,))
+        if not cur.fetchone():
+            error_msg = 'Client not found'
+            logger.error(f"Renew client error: {error_msg} - ID: {client_id}")
+            return jsonify({'success': False, 'error': error_msg}), 404
+        
+        # Update client's renewal date
+        cur.execute('''
             UPDATE clients 
-            SET renewal_date = %s, updated_at = CURRENT_TIMESTAMP 
+            SET renewal_date = %s, 
+                updated_at = CURRENT_TIMESTAMP 
             WHERE id = %s
-        """, (renewal_date, client_id))
-
-        if cur.rowcount == 0:
-            flash('Client not found', 'error')
-            return redirect(url_for('get_clients'))
-
+            RETURNING id, name, renewal_date
+        ''', (formatted_date, client_id))
+        
+        updated = cur.fetchone()
         conn.commit()
-        flash('Client renewed successfully', 'success')
-        return redirect(url_for('get_clients'))
-
+        
+        if updated:
+            logger.info(f"Successfully renewed client {updated[1]} (ID: {updated[0]}) to {updated[2]}")
+            return jsonify({
+                'success': True,
+                'message': 'Renewal date updated successfully',
+                'client_id': updated[0],
+                'renewal_date': formatted_date
+            })
+        else:
+            error_msg = 'Failed to update renewal date'
+            logger.error(f"Renew client error: {error_msg}")
+            return jsonify({'success': False, 'error': error_msg}), 500
+            
+    except psycopg2.Error as e:
+        error_msg = f"Database error: {str(e)}"
+        logger.error(f"Renew client database error: {error_msg}")
+        if conn:
+            conn.rollback()
+        return jsonify({'success': False, 'error': error_msg}), 500
+        
     except Exception as e:
-        logger.error(f"Error renewing client: {e}")
-        flash('Error renewing client', 'error')
-        return redirect(url_for('get_clients'))
-
-@app.route('/check_client_exists')
-def check_client_exists():
-    """Check if a client exists by email"""
-    try:
-        email = request.args.get('email')
-        if not email:
-            return jsonify({'exists': False})
-
-        conn = get_db()
-        cur = conn.cursor()
-
-        cur.execute("SELECT id FROM clients WHERE email = %s", (email,))
-        exists = cur.fetchone() is not None
-
-        return jsonify({'exists': exists})
-
-    except Exception as e:
-        logger.error(f"Error checking client existence: {e}")
-        return jsonify({'error': 'Error checking client'}), 500
+        error_msg = f"Unexpected error: {str(e)}"
+        logger.error(f"Renew client error: {error_msg}", exc_info=True)
+        if conn:
+            conn.rollback()
+        return jsonify({'success': False, 'error': error_msg}), 500
+        
+    finally:
+        if 'cur' in locals():
+            cur.close()
+        if conn:
+            conn.close()
 
 @app.route('/delete_account', methods=['POST'])
 @limiter.limit("5 per minute")
@@ -854,28 +836,38 @@ def check_client_exists():
 )
 def delete_account():
     """Delete an account and all its client associations"""
+    conn = None
     try:
-        account_id = request.form['account_id']
-
+        account_id = request.form.get('account_id')
+        
+        if not account_id:
+            flash('Account ID is required', 'danger')
+            return redirect(url_for('index'))
+        
         conn = get_db()
         cur = conn.cursor()
         
-        # Delete account and associated clients
-        cur.execute("DELETE FROM clients WHERE account_id = %s", (account_id,))
-        cur.execute("DELETE FROM accounts WHERE id = %s", (account_id,))
+        # Delete the account (client_accounts will be deleted automatically due to ON DELETE CASCADE)
+        cur.execute('DELETE FROM accounts WHERE id = %s', (account_id,))
         
         if cur.rowcount == 0:
-            flash('Account not found', 'error')
-            return redirect(url_for('index'))
-            
-        conn.commit()
-        flash('Account deleted successfully', 'success')
-        return redirect(url_for('index'))
+            flash('Account not found', 'danger')
+        else:
+            conn.commit()
+            flash('Account deleted successfully', 'success')
         
     except Exception as e:
         logger.error(f"Error deleting account: {e}")
-        flash('Error deleting account', 'error')
-        return redirect(url_for('index'))
+        flash('Error deleting account', 'danger')
+        if conn:
+            conn.rollback()
+    finally:
+        if 'cur' in locals():
+            cur.close()
+        if conn:
+            conn.close()
+    
+    return redirect(url_for('index'))
 
 @app.route('/clients')
 @route_manager.monitor(
@@ -1041,7 +1033,6 @@ if __name__ == '__main__':
     try:
         init_db()
         with app.app_context():
-            create_default_admin()  # Create default admin user
             initial_health = health_checker.check_application()
             if initial_health['status'] != 'healthy':
                 logger.warning("Application started with unhealthy status")

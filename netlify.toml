@@ -1,53 +1,12 @@
 [build]
-  command = "bash build.sh"
-  publish = "public"
-  functions = "netlify/functions"
-
-[build.environment]
-  PYTHON_VERSION = "3.9"
-  NODE_VERSION = "16"
-  PIP_VERSION = "23.0"
+  base = "src/"
+  publish = "static/"
+  command = "python build.py"
 
 [[redirects]]
   from = "/*"
-  to = "/.netlify/functions/app/:splat"
+  to = "/index.html"
   status = 200
 
-[functions]
-  directory = "netlify/functions"
-  node_bundler = "esbuild"
-
-# Custom domain configuration
-[build.processing]
-  skip_processing = false
-
-[build.processing.html]
-  pretty_urls = true
-
-[build.processing.css]
-  bundle = true
-  minify = true
-
-[build.processing.js]
-  bundle = true
-  minify = true
-
-[build.processing.images]
-  compress = true
-
-# SSL/TLS configuration
-[[headers]]
-  for = "/*"
-  [headers.values]
-    X-Frame-Options = "DENY"
-    X-XSS-Protection = "1; mode=block"
-    X-Content-Type-Options = "nosniff"
-    Referrer-Policy = "strict-origin-when-cross-origin"
-    Content-Security-Policy = "default-src 'self' 'unsafe-inline' 'unsafe-eval' https:; img-src 'self' data: https:; font-src 'self' https: data:;"
-
-# Force HTTPS
-[[redirects]]
-  from = "http://*"
-  to = "https://:splat"
-  status = 301
-  force = true 
+[build.environment]
+  PYTHON_VERSION = "3.11" 
