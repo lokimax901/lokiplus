@@ -172,6 +172,23 @@ def index():
         accounts_response = supabase.table('accounts').select('*').execute()
         clients_response = supabase.table('clients').select('*').execute()
         
+        # Get client count for each account
+        for account in accounts_response.data:
+            # Count clients linked to this account
+            count_result = supabase.table('account_clients').select(
+                'id', count='exact'
+            ).eq('account_id', account['id']).execute()
+            account['client_count'] = count_result.count or 0
+            
+            # Format the created_at date
+            if account.get('created_at'):
+                try:
+                    created_at = datetime.fromisoformat(account['created_at'].replace('Z', '+00:00'))
+                    account['created_at'] = created_at.strftime('%Y-%m-%d %H:%M:%S')
+                except Exception as e:
+                    logger.warning(f"Error formatting date: {e}")
+                    account['created_at'] = account['created_at']
+        
         return render_template('index.html', 
                              accounts=accounts_response.data, 
                              clients=clients_response.data,
