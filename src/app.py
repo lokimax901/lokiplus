@@ -168,19 +168,29 @@ def get_db():
 def index():
     """Render the main page with accounts and clients"""
     try:
-        # Fetch accounts from Supabase
+        # Try to connect to Supabase and fetch data
         accounts_response = supabase.table('accounts').select('*').execute()
-        accounts = accounts_response.data
-
-        # Fetch clients from Supabase
         clients_response = supabase.table('clients').select('*').execute()
-        clients = clients_response.data
         
-        return render_template('index.html', accounts=accounts, clients=clients)
+        return render_template('index.html', 
+                             accounts=accounts_response.data, 
+                             clients=clients_response.data,
+                             db_error=None,
+                             error=None)
     except Exception as e:
         logger.error(f"Error fetching data: {e}")
-        flash('Error fetching data. Please try again later.', 'danger')
-        return render_template('index.html', accounts=[], clients=[], error=str(e))
+        if 'connection' in str(e).lower() or 'network' in str(e).lower():
+            return render_template('index.html', 
+                                 accounts=[], 
+                                 clients=[], 
+                                 db_error=True,
+                                 error=None)
+        else:
+            return render_template('index.html', 
+                                 accounts=[], 
+                                 clients=[], 
+                                 db_error=None,
+                                 error=str(e))
 
 @app.route('/add_account', methods=['POST'])
 def add_account():
