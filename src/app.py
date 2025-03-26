@@ -25,6 +25,8 @@ CORS(app, resources={
     r"/*": {
         "origins": [
             "https://lokiplus.netlify.app",
+            "http://localhost:5173",
+            "http://localhost:4173",
             "http://localhost:5000",
             "http://127.0.0.1:5000"
         ],
@@ -190,7 +192,7 @@ def get_db():
     return supabase.client.postgrest.client()
 
 @app.route('/')
-@route_manager.monitor(name='index')
+@route_manager.monitor()
 def index():
     """Render the main page with accounts and clients"""
     try:
