@@ -1,5 +1,4 @@
 from flask import Flask, render_template, request, flash, redirect, url_for, jsonify
-import psycopg2
 import bcrypt
 import os
 from dotenv import load_dotenv
@@ -7,12 +6,12 @@ import logging
 from datetime import datetime
 import re
 from config import Config, supabase
-from db import DatabasePool
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from route_manager import route_manager
 from health_checker import health_checker
 from flask_cors import CORS
+from functools import wraps
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -41,18 +40,76 @@ limiter = Limiter(
     default_limits=["200 per day", "50 per hour"]
 )
 
+# Helper functions and decorators
+def validate_json_request(*required_fields):
+    """Decorator to validate JSON request data"""
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            if not request.is_json:
+                return jsonify({'error': 'Content-Type must be application/json'}), 400
+            
+            data = request.get_json()
+            if not data:
+                return jsonify({'error': 'No JSON data provided'}), 400
+            
+            missing_fields = [field for field in required_fields if field not in data]
+            if missing_fields:
+                return jsonify({
+                    'error': 'Missing required fields',
+                    'missing_fields': missing_fields
+                }), 400
+            
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
+
+def check_db_health():
+    """Check database health and connection"""
+    try:
+        # Try a simple query to check connection
+        supabase.table('accounts').select('id').limit(1).execute()
+        return True
+    except Exception as e:
+        logger.error(f"Database health check failed: {e}")
+        health_checker.check_database(force=True)
+        return False
+
+def hash_password(password):
+    """Hash a password using bcrypt"""
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+def verify_password(password, hashed):
+    """Verify a password against its hash"""
+    return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
+
+def validate_email(email):
+    """Validate email format"""
+    return re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email) is not None
+
+def validate_password(password):
+    """Validate password strength"""
+    if len(password) < 8:
+        return False
+    if not re.search(r'[A-Z]', password):
+        return False
+    if not re.search(r'[a-z]', password):
+        return False
+    if not re.search(r'[0-9]', password):
+        return False
+    return True
+
 # Health check endpoints
 @app.route('/health')
 def health_check():
     """Health check endpoint for Render."""
     try:
-        # Check database connection
-        supabase.table('accounts').select('id').limit(1).execute()
+        is_healthy = check_db_health()
         return jsonify({
-            'status': 'healthy',
+            'status': 'healthy' if is_healthy else 'unhealthy',
             'timestamp': datetime.utcnow().isoformat(),
-            'database': 'connected'
-        }), 200
+            'database': 'connected' if is_healthy else 'disconnected'
+        }), 200 if is_healthy else 503
     except Exception as e:
         return jsonify({
             'status': 'unhealthy',
@@ -121,282 +178,92 @@ def live_status():
 def check_db_connection():
     """Check database connection and handle errors"""
     try:
-        conn = get_db()
-        return conn
-    except psycopg2.OperationalError as e:
-        logger.error(f"Database connection error: {e}")
-        health_checker.check_database(force=True)  # Force update health status
-        raise
+        supabase.table('accounts').select('id').limit(1).execute()
+        return True
     except Exception as e:
-        logger.error(f"Unexpected database error: {e}")
+        logger.error(f"Database connection error: {e}")
         health_checker.check_database(force=True)  # Force update health status
         raise
 
 def get_db():
-    """Get database connection from pool"""
-    try:
-        conn = psycopg2.connect(
-            dbname=Config.DB_CONFIG['database'],
-            user=Config.DB_CONFIG['user'],
-            password=Config.DB_CONFIG['password'],
-            host=Config.DB_CONFIG['host'],
-            port=Config.DB_CONFIG['port']
-        )
-        return conn
-    except Exception as e:
-        logger.error(f"Database connection error: {e}")
-        raise
-
-def verify_table_structure(cur, table_name):
-    """Verify that a table has the expected structure"""
-    # Get table columns
-    cur.execute("""
-        SELECT column_name, data_type, is_nullable
-        FROM information_schema.columns
-        WHERE table_name = %s
-        ORDER BY ordinal_position
-    """, (table_name,))
-    columns = cur.fetchall()
-    
-    # Get table indexes
-    cur.execute("""
-        SELECT indexname, indexdef
-        FROM pg_indexes
-        WHERE tablename = %s
-    """, (table_name,))
-    indexes = cur.fetchall()
-    
-    return {
-        'columns': columns,
-        'indexes': indexes
-    }
-
-def init_db():
-    """Initialize the database and create tables if they don't exist"""
-    conn = None
-    try:
-        # First connect to default postgres database to create our database if it doesn't exist
-        conn = psycopg2.connect(
-            dbname='postgres',
-            user=Config.DB_CONFIG['user'],
-            password=Config.DB_CONFIG['password'],
-            host=Config.DB_CONFIG['host'],
-            port=Config.DB_CONFIG['port']
-        )
-        conn.autocommit = True
-        cur = conn.cursor()
-        
-        # Create database if it doesn't exist
-        cur.execute(f"SELECT 1 FROM pg_database WHERE datname = '{Config.DB_CONFIG['database']}'")
-        if not cur.fetchone():
-            cur.execute(f"CREATE DATABASE {Config.DB_CONFIG['database']}")
-            logger.info(f"Created database {Config.DB_CONFIG['database']}")
-        
-        cur.close()
-        conn.close()
-        
-        # Now connect to our database and create/validate the tables
-        conn = psycopg2.connect(**Config.DB_CONFIG)
-        conn.autocommit = False  # Disable autocommit for transaction control
-        cur = conn.cursor()
-        
-        # Begin transaction
-        cur.execute("BEGIN")
-        
-        try:
-            # Read and execute schema.sql
-            schema_path = os.path.join(os.path.dirname(__file__), 'database', 'schema.sql')
-            with open(schema_path, 'r') as f:
-                schema_sql = f.read()
-                # Execute the entire schema as one statement
-                cur.execute(schema_sql)
-            
-            # Verify tables exist
-            tables = ['clients', 'accounts', 'client_accounts']
-            for table in tables:
-                cur.execute("""
-                    SELECT EXISTS (
-                        SELECT FROM information_schema.tables 
-                        WHERE table_name = %s
-                    )
-                """, (table,))
-                if not cur.fetchone()[0]:
-                    raise Exception(f"Table {table} was not created properly")
-                
-                # Verify columns for each table
-                cur.execute("""
-                    SELECT column_name, data_type
-                    FROM information_schema.columns
-                    WHERE table_name = %s
-                    ORDER BY ordinal_position
-                """, (table,))
-                columns = cur.fetchall()
-                logger.info(f"Table {table} columns: {[col[0] for col in columns]}")
-            
-            # Commit transaction if everything is successful
-            conn.commit()
-            logger.info("Database schema initialized and verified successfully")
-            
-        except Exception as e:
-            conn.rollback()
-            logger.error(f"Error during schema initialization: {e}")
-            raise
-            
-    except Exception as e:
-        logger.error(f"Error initializing database: {e}")
-        raise
-    finally:
-        if 'cur' in locals():
-            cur.close()
-        if conn:
-            conn.close()
-
-def hash_password(password):
-    """Hash a password using bcrypt"""
-    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-
-def verify_password(password, hashed):
-    """Verify a password against its hash"""
-    return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
-
-def validate_email(email):
-    """Validate email format"""
-    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-    return re.match(pattern, email) is not None
-
-def validate_password(password):
-    """Validate password strength"""
-    if len(password) < 8:
-        return False, "Password must be at least 8 characters long"
-    if not re.search(r"[A-Z]", password):
-        return False, "Password must contain at least one uppercase letter"
-    if not re.search(r"[a-z]", password):
-        return False, "Password must contain at least one lowercase letter"
-    if not re.search(r"\d", password):
-        return False, "Password must contain at least one number"
-    return True, "Password is valid"
+    """Get database connection"""
+    return supabase.client.postgrest.client()
 
 @app.route('/')
-@route_manager.monitor(
-    route='/',
-    description="Main page displaying accounts and clients"
-)
+@route_manager.monitor(name='index')
 def index():
-    """Display all accounts"""
-    conn = None
+    """Render the main page with accounts and clients"""
     try:
-        conn = check_db_connection()
-        cur = conn.cursor()
-        
-        # Get all accounts with their client counts
-        cur.execute('''
-            SELECT a.id, a.email, a.password, a.status, 
-                   a.created_at AT TIME ZONE 'UTC',
-                   a.updated_at AT TIME ZONE 'UTC',
-                   (SELECT COUNT(*) FROM client_accounts WHERE account_id = a.id) as client_count
-            FROM accounts a 
-            ORDER BY a.created_at DESC
-        ''')
-        accounts = cur.fetchall()
-        
-        # Get all clients
-        cur.execute('SELECT * FROM clients ORDER BY name')
-        clients = cur.fetchall()
+        # Fetch accounts from Supabase
+        accounts_response = supabase.table('accounts').select('*').execute()
+        accounts = accounts_response.data
+
+        # Fetch clients from Supabase
+        clients_response = supabase.table('clients').select('*').execute()
+        clients = clients_response.data
         
         return render_template('index.html', accounts=accounts, clients=clients)
-    except psycopg2.OperationalError:
-        flash('Database connection error. Please try again later.', 'danger')
-        return render_template('index.html', accounts=[], clients=[], db_error=True)
     except Exception as e:
         logger.error(f"Error fetching data: {e}")
         flash('Error fetching data. Please try again later.', 'danger')
         return render_template('index.html', accounts=[], clients=[], error=str(e))
-    finally:
-        if 'cur' in locals():
-            cur.close()
-        if conn:
-            conn.close()
 
 @app.route('/add_account', methods=['POST'])
-@limiter.limit("5 per minute")
-@route_manager.monitor(
-    route='/add_account',
-    required_params={
-        'POST': {
-            'email': str,
-            'password': str,
-            'status': str
-        }
-    },
-    description="Add a new account"
-)
+@route_manager.monitor(name='add_account')
 def add_account():
     """Add a new account"""
-    conn = None
     try:
         email = request.form.get('email')
         password = request.form.get('password')
-        status = request.form.get('status', 'active')
         
         if not email or not password:
             flash('Email and password are required', 'danger')
             return redirect(url_for('index'))
-        
-        # Validate email format
+            
         if not validate_email(email):
             flash('Invalid email format', 'danger')
             return redirect(url_for('index'))
-        
-        # Validate password strength
-        is_valid, message = validate_password(password)
-        if not is_valid:
-            flash(message, 'danger')
+            
+        if not validate_password(password):
+            flash('Password must be at least 8 characters long and contain at least one uppercase letter, one lowercase letter, and one number', 'danger')
             return redirect(url_for('index'))
-        
-        conn = get_db()
-        cur = conn.cursor()
-        
-        # Check if email already exists
-        cur.execute('SELECT id FROM accounts WHERE email = %s', (email,))
-        if cur.fetchone():
-            flash('Email already exists', 'danger')
-            return redirect(url_for('index'))
-        
-        # Hash password and insert account
+            
+        # Hash the password
         hashed_password = hash_password(password)
-        cur.execute(
-            'INSERT INTO accounts (email, password, status) VALUES (%s, %s, %s)',
-            (email, hashed_password, status)
-        )
-        conn.commit()
-        flash('Account added successfully', 'success')
+        
+        # Check if account already exists
+        existing = supabase.table('accounts').select('id').eq('email', email).execute()
+        if existing.data:
+            flash('An account with this email already exists', 'danger')
+            return redirect(url_for('index'))
+            
+        # Insert new account
+        new_account = {
+            'email': email,
+            'password': hashed_password,
+            'status': 'active',
+            'created_at': datetime.utcnow().isoformat(),
+            'updated_at': datetime.utcnow().isoformat()
+        }
+        result = supabase.table('accounts').insert(new_account).execute()
+        
+        if result.data:
+            flash(f'Account {email} created successfully', 'success')
+        else:
+            flash('Error creating account', 'danger')
+            
+        return redirect(url_for('index'))
         
     except Exception as e:
         logger.error(f"Error adding account: {e}")
         flash('Error adding account', 'danger')
-    finally:
-        if 'cur' in locals():
-            cur.close()
-        if conn:
-            conn.close()
-    
-    return redirect(url_for('index'))
+        return redirect(url_for('index'))
 
 @app.route('/update_status', methods=['POST'])
 @limiter.limit("10 per minute")
-@route_manager.monitor(
-    route='/update_status',
-    required_params={
-        'POST': {
-            'account_id': str,
-            'status': str
-        }
-    },
-    description="Update account status"
-)
+@route_manager.monitor(name='update_status')
 def update_status():
     """Update account status"""
-    conn = None
     try:
         account_id = request.form.get('account_id')
         new_status = request.form.get('status')
@@ -405,329 +272,217 @@ def update_status():
             flash('Account ID and status are required', 'danger')
             return redirect(url_for('index'))
         
-        conn = get_db()
-        cur = conn.cursor()
+        result = supabase.table('accounts').update({
+            'status': new_status,
+            'updated_at': datetime.utcnow().isoformat()
+        }).eq('id', account_id).execute()
         
-        cur.execute(
-            'UPDATE accounts SET status = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s',
-            (new_status, account_id)
-        )
-        conn.commit()
-        flash('Status updated successfully', 'success')
+        if result.data:
+            flash('Status updated successfully', 'success')
+        else:
+            flash('Error updating status', 'danger')
         
     except Exception as e:
         logger.error(f"Error updating status: {e}")
         flash('Error updating status', 'danger')
-    finally:
-        if 'cur' in locals():
-            cur.close()
-        if conn:
-            conn.close()
     
     return redirect(url_for('index'))
 
 @app.route('/check_client', methods=['POST'])
-@route_manager.monitor(
-    route='/check_client',
-    required_params={
-        'POST': {
-            'email': str
-        }
-    },
-    description="Check if a client exists"
-)
+@route_manager.monitor(name='check_client')
+@validate_json_request('email')
 def check_client():
     """Check if a client with the given email already exists"""
-    conn = None
     try:
-        email = request.form.get('email')
-        if not email:
-            return {'exists': False}
+        data = request.get_json()
+        email = data['email']
         
-        conn = get_db()
-        cur = conn.cursor()
+        result = supabase.table('clients').select('*').eq('email', email).execute()
         
-        cur.execute('''
-            SELECT id, name, email, phone, renewal_date
-            FROM clients
-            WHERE email = %s
-        ''', (email,))
-        
-        client = cur.fetchone()
-        if client:
-            return {
+        if result.data:
+            client = result.data[0]
+            return jsonify({
                 'exists': True,
                 'client': {
-                    'id': client[0],
-                    'name': client[1],
-                    'email': client[2],
-                    'phone': client[3],
-                    'renewal_date': client[4].strftime('%Y-%m-%d') if client[4] else None
+                    'id': client['id'],
+                    'name': client['name'],
+                    'email': client['email'],
+                    'renewal_date': client['renewal_date']
                 }
-            }
-        return {'exists': False}
+            })
+        return jsonify({'exists': False})
         
     except Exception as e:
         logger.error(f"Error checking client: {e}")
-        return {'error': str(e)}, 500
-    finally:
-        if 'cur' in locals():
-            cur.close()
-        if conn:
-            conn.close()
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/add_client', methods=['POST'])
-@limiter.limit("5 per minute")
-@route_manager.monitor(
-    route='/add_client',
-    required_params={
-        'POST': {
-            'name': str,
-            'email': str
-        }
-    },
-    description="Add a new client"
-)
+@route_manager.monitor(name='add_client')
 def add_client():
     """Add a new client"""
-    conn = None
     try:
         name = request.form.get('name')
         email = request.form.get('email')
-        phone = request.form.get('phone')
+        account_id = request.form.get('account_id')
         renewal_date = request.form.get('renewal_date')
-        force_add = request.form.get('force_add') == 'true'
         
-        logger.info(f"Attempting to add client - Name: {name}, Email: {email}, Phone: {phone}, Renewal: {renewal_date}")
-        
-        # Validate required fields
-        if not name or not name.strip():
-            flash('Client name is required', 'danger')
+        if not all([name, email, account_id, renewal_date]):
+            flash('All fields are required', 'danger')
             return redirect(url_for('index'))
             
-        if not email or not email.strip():
-            flash('Email is required', 'danger')
-            return redirect(url_for('index'))
-        
-        # Validate email format
         if not validate_email(email):
             flash('Invalid email format', 'danger')
             return redirect(url_for('index'))
-        
-        # Clean and validate phone number if provided
-        if phone:
-            phone = phone.strip()
-            if not re.match(r'^\+?1?\d{9,15}$', phone):
-                flash('Invalid phone number format. Please use numbers only, optionally with country code.', 'danger')
-                return redirect(url_for('index'))
-        
-        # Validate renewal date if provided
-        if renewal_date:
-            try:
-                # Ensure the date is in YYYY-MM-DD format
-                renewal_date = datetime.strptime(renewal_date, '%Y-%m-%d').date()
-            except ValueError as e:
-                logger.error(f"Date parsing error: {e}")
-                flash('Invalid renewal date format. Please use YYYY-MM-DD format.', 'danger')
-                return redirect(url_for('index'))
-        
-        conn = check_db_connection()  # Use the connection checker instead
-        cur = conn.cursor()
-        
-        # Check if email already exists
-        cur.execute('SELECT id FROM clients WHERE email = %s', (email,))
-        if cur.fetchone() and not force_add:
-            flash('Email already exists', 'danger')
+            
+        # Check if client already exists
+        existing = supabase.table('clients').select('id').eq('email', email).execute()
+        if existing.data:
+            flash('A client with this email already exists', 'danger')
             return redirect(url_for('index'))
-        
+            
         # Insert new client
-        try:
-            logger.info("Executing client insert query...")
-            cur.execute(
-                'INSERT INTO clients (name, email, phone, renewal_date) VALUES (%s, %s, %s, %s) RETURNING id',
-                (name.strip(), email.strip(), phone, renewal_date)
-            )
-            new_client_id = cur.fetchone()[0]
-            conn.commit()
-            logger.info(f"Successfully added client with ID: {new_client_id}")
-            flash(f'Client {name} added successfully', 'success')
+        new_client = {
+            'name': name,
+            'email': email,
+            'renewal_date': renewal_date,
+            'status': 'active',
+            'created_at': datetime.utcnow().isoformat(),
+            'updated_at': datetime.utcnow().isoformat()
+        }
+        client_result = supabase.table('clients').insert(new_client).execute()
+        
+        if client_result.data:
+            # Create account-client relationship
+            client_id = client_result.data[0]['id']
+            relation = {
+                'account_id': account_id,
+                'client_id': client_id,
+                'created_at': datetime.utcnow().isoformat()
+            }
+            relation_result = supabase.table('account_clients').insert(relation).execute()
             
-        except psycopg2.IntegrityError as e:
-            conn.rollback()
-            logger.error(f"Database integrity error: {e}")
-            if 'unique constraint' in str(e).lower():
-                flash('A client with this email already exists', 'danger')
+            if relation_result.data:
+                flash(f'Client {name} added successfully', 'success')
             else:
-                flash('Error adding client: database constraint violation', 'danger')
-            return redirect(url_for('index'))
+                # Rollback client creation if relation fails
+                supabase.table('clients').delete().eq('id', client_id).execute()
+                flash('Error linking client to account', 'danger')
+        else:
+            flash('Error adding client', 'danger')
             
-        except psycopg2.Error as e:
-            conn.rollback()
-            logger.error(f"Database error adding client: {e}")
-            flash('Error adding client: database error', 'danger')
-            return redirect(url_for('index'))
-            
+        return redirect(url_for('index'))
+        
     except Exception as e:
-        logger.error(f"Unexpected error adding client: {e}", exc_info=True)
-        flash(f'Error adding client: {str(e)}', 'danger')
-        if conn:
-            conn.rollback()
-    finally:
-        if 'cur' in locals():
-            cur.close()
-        if conn:
-            conn.close()
-    
-    return redirect(url_for('index'))
+        logger.error(f"Error adding client: {e}")
+        flash('Error adding client', 'danger')
+        return redirect(url_for('index'))
 
 @app.route('/link_client', methods=['POST'])
 @limiter.limit("5 per minute")
-@route_manager.monitor(
-    route='/link_client',
-    required_params={
-        'POST': {
-            'client_id': str,
-            'account_id': str
-        }
-    },
-    description="Link a client to an account"
-)
+@route_manager.monitor(name='link_client')
+@validate_json_request('client_id', 'account_id')
 def link_client():
     """Link a client to an account"""
-    conn = None
     try:
-        client_id = request.form.get('client_id')
-        account_id = request.form.get('account_id')
-        
-        if not client_id or not account_id:
-            flash('Client and account are required', 'danger')
-            return redirect(url_for('index'))
-        
-        conn = get_db()
-        cur = conn.cursor()
+        data = request.get_json()
+        client_id = data['client_id']
+        account_id = data['account_id']
         
         # Check if account already has 5 clients
-        cur.execute('''
-            SELECT COUNT(*) FROM client_accounts 
-            WHERE account_id = %s
-        ''', (account_id,))
-        client_count = cur.fetchone()[0]
+        count_result = supabase.table('account_clients').select(
+            'id', count='exact'
+        ).eq('account_id', account_id).execute()
         
-        if client_count >= 5:
-            flash('Account already has maximum number of clients (5)', 'danger')
-            return redirect(url_for('index'))
+        if count_result.count >= 5:
+            return jsonify({
+                'success': False,
+                'error': 'Account already has maximum number of clients (5)'
+            }), 400
         
         # Check if client is already linked to this account
-        cur.execute('''
-            SELECT id FROM client_accounts 
-            WHERE client_id = %s AND account_id = %s
-        ''', (client_id, account_id))
-        if cur.fetchone():
-            flash('Client is already linked to this account', 'danger')
-            return redirect(url_for('index'))
+        existing = supabase.table('account_clients').select('id').match({
+            'client_id': client_id,
+            'account_id': account_id
+        }).execute()
+        
+        if existing.data:
+            return jsonify({
+                'success': False,
+                'error': 'Client is already linked to this account'
+            }), 400
         
         # Link client to account
-        cur.execute(
-            'INSERT INTO client_accounts (client_id, account_id) VALUES (%s, %s)',
-            (client_id, account_id)
-        )
-        conn.commit()
-        flash('Client linked successfully', 'success')
+        result = supabase.table('account_clients').insert({
+            'client_id': client_id,
+            'account_id': account_id,
+            'created_at': datetime.utcnow().isoformat()
+        }).execute()
+        
+        if result.data:
+            return jsonify({'success': True})
+        else:
+            return jsonify({'success': False, 'error': 'Failed to link client'}), 500
         
     except Exception as e:
         logger.error(f"Error linking client: {e}")
-        flash('Error linking client', 'danger')
-    finally:
-        if 'cur' in locals():
-            cur.close()
-        if conn:
-            conn.close()
-    
-    return redirect(url_for('index'))
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/unlink_client', methods=['POST'])
 @limiter.limit("5 per minute")
-@route_manager.monitor(
-    route='/unlink_client',
-    required_params={
-        'POST': {
-            'client_id': str,
-            'account_id': str
-        }
-    },
-    description="Unlink a client from an account"
-)
+@route_manager.monitor(name='unlink_client')
+@validate_json_request('client_id', 'account_id')
 def unlink_client():
     """Unlink a client from an account"""
-    conn = None
     try:
-        client_id = request.form.get('client_id')
-        account_id = request.form.get('account_id')
+        data = request.get_json()
+        client_id = data['client_id']
+        account_id = data['account_id']
         
-        if not client_id or not account_id:
-            flash('Client and account are required', 'danger')
-            return redirect(url_for('index'))
+        result = supabase.table('account_clients').delete().match({
+            'client_id': client_id,
+            'account_id': account_id
+        }).execute()
         
-        conn = get_db()
-        cur = conn.cursor()
-        
-        # Unlink client from account
-        cur.execute('''
-            DELETE FROM client_accounts 
-            WHERE client_id = %s AND account_id = %s
-        ''', (client_id, account_id))
-        
-        if cur.rowcount == 0:
-            flash('Client is not linked to this account', 'danger')
+        if result.data:
+            return jsonify({'success': True})
         else:
-            conn.commit()
-            flash('Client unlinked successfully', 'success')
+            return jsonify({
+                'success': False,
+                'error': 'Client is not linked to this account'
+            }), 404
         
     except Exception as e:
         logger.error(f"Error unlinking client: {e}")
-        flash('Error unlinking client', 'danger')
-    finally:
-        if 'cur' in locals():
-            cur.close()
-        if conn:
-            conn.close()
-    
-    return redirect(url_for('index'))
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/account_clients/<int:account_id>')
-@route_manager.monitor(
-    route='/account_clients/<int:account_id>',
-    description="Get all clients linked to an account"
-)
+@route_manager.monitor(name='get_account_clients')
 def get_account_clients(account_id):
     """Get all clients linked to an account"""
-    conn = None
     try:
-        conn = get_db()
-        cur = conn.cursor()
-        
         # First check if the account exists
-        cur.execute('SELECT id FROM accounts WHERE id = %s', (account_id,))
-        if not cur.fetchone():
+        account = supabase.table('accounts').select('id').eq('id', account_id).execute()
+        if not account.data:
             return {'error': 'Account not found'}, 404
         
-        # Get all clients linked to this account
-        cur.execute('''
-            SELECT c.id, c.name, c.email, c.phone, c.renewal_date
-            FROM clients c
-            JOIN client_accounts ca ON c.id = ca.client_id
-            WHERE ca.account_id = %s
-            ORDER BY c.name
-        ''', (account_id,))
+        # Get all clients linked to this account through the account_clients table
+        relations = supabase.table('account_clients').select(
+            'client_id'
+        ).eq('account_id', account_id).execute()
+        
+        if not relations.data:
+            return {'clients': []}
+        
+        client_ids = [r['client_id'] for r in relations.data]
+        clients_result = supabase.table('clients').select('*').in_('id', client_ids).execute()
         
         clients = []
-        for row in cur.fetchall():
+        for client in clients_result.data:
             clients.append({
-                'id': row[0],
-                'name': row[1],
-                'email': row[2],
-                'phone': row[3],
-                'renewal_date': row[4].strftime('%Y-%m-%d') if row[4] else None
+                'id': client['id'],
+                'name': client['name'],
+                'email': client['email'],
+                'renewal_date': client['renewal_date']
             })
         
         return {'clients': clients}
@@ -735,135 +490,38 @@ def get_account_clients(account_id):
     except Exception as e:
         logger.error(f"Error fetching account clients: {e}")
         return {'error': str(e)}, 500
-    finally:
-        if 'cur' in locals():
-            cur.close()
-        if conn:
-            conn.close()
 
 @app.route('/renew_client', methods=['POST'])
-@limiter.limit("5 per minute")
-@route_manager.monitor(
-    route='/renew_client',
-    required_params={
-        'POST': {
-            'client_id': str,
-            'renewal_date': str
-        }
-    },
-    description="Renew a client's account"
-)
+@route_manager.monitor(name='renew_client')
+@validate_json_request('client_id', 'renewal_date')
 def renew_client():
-    """Renew a client's account"""
-    conn = None
+    """Renew a client's subscription"""
     try:
-        # Try to get data from both JSON and form data
-        if request.is_json:
-            data = request.get_json()
+        data = request.get_json()
+        client_id = data['client_id']
+        new_renewal_date = data['renewal_date']
+            
+        # Update client renewal date
+        result = supabase.table('clients').update({
+            'renewal_date': new_renewal_date,
+            'updated_at': datetime.utcnow().isoformat()
+        }).eq('id', client_id).execute()
+        
+        if result.data:
+            return jsonify({'success': True})
         else:
-            data = request.form
-
-        client_id = data.get('client_id')
-        renewal_date = data.get('renewal_date')
-        
-        # Validate required parameters
-        if not client_id:
-            error_msg = 'Client ID is required'
-            logger.error(f"Renew client error: {error_msg}")
-            return jsonify({'success': False, 'error': error_msg}), 400
+            return jsonify({'success': False, 'error': 'Failed to update renewal date'}), 500
             
-        if not renewal_date:
-            error_msg = 'Renewal date is required'
-            logger.error(f"Renew client error: {error_msg}")
-            return jsonify({'success': False, 'error': error_msg}), 400
-            
-        # Convert client_id to integer
-        try:
-            client_id = int(client_id)
-        except ValueError:
-            error_msg = 'Invalid client ID format'
-            logger.error(f"Renew client error: {error_msg}")
-            return jsonify({'success': False, 'error': error_msg}), 400
-            
-        # Validate renewal date format
-        try:
-            # Parse and format the date to ensure it's valid
-            parsed_date = datetime.strptime(renewal_date, '%Y-%m-%d').date()
-            formatted_date = parsed_date.strftime('%Y-%m-%d')
-        except ValueError as e:
-            error_msg = 'Invalid date format. Please use YYYY-MM-DD'
-            logger.error(f"Renew client error: {error_msg} - {str(e)}")
-            return jsonify({'success': False, 'error': error_msg}), 400
-        
-        conn = check_db_connection()
-        cur = conn.cursor()
-        
-        # First check if client exists
-        cur.execute('SELECT id FROM clients WHERE id = %s', (client_id,))
-        if not cur.fetchone():
-            error_msg = 'Client not found'
-            logger.error(f"Renew client error: {error_msg} - ID: {client_id}")
-            return jsonify({'success': False, 'error': error_msg}), 404
-        
-        # Update client's renewal date
-        cur.execute('''
-            UPDATE clients 
-            SET renewal_date = %s, 
-                updated_at = CURRENT_TIMESTAMP 
-            WHERE id = %s
-            RETURNING id, name, renewal_date
-        ''', (formatted_date, client_id))
-        
-        updated = cur.fetchone()
-        conn.commit()
-        
-        if updated:
-            logger.info(f"Successfully renewed client {updated[1]} (ID: {updated[0]}) to {updated[2]}")
-            return jsonify({
-                'success': True,
-                'message': 'Renewal date updated successfully',
-                'client_id': updated[0],
-                'renewal_date': formatted_date
-            })
-        else:
-            error_msg = 'Failed to update renewal date'
-            logger.error(f"Renew client error: {error_msg}")
-            return jsonify({'success': False, 'error': error_msg}), 500
-            
-    except psycopg2.Error as e:
-        error_msg = f"Database error: {str(e)}"
-        logger.error(f"Renew client database error: {error_msg}")
-        if conn:
-            conn.rollback()
-        return jsonify({'success': False, 'error': error_msg}), 500
-        
     except Exception as e:
-        error_msg = f"Unexpected error: {str(e)}"
-        logger.error(f"Renew client error: {error_msg}", exc_info=True)
-        if conn:
-            conn.rollback()
+        error_msg = f"Error renewing client: {str(e)}"
+        logger.error(f"Renew client error: {error_msg}")
         return jsonify({'success': False, 'error': error_msg}), 500
-        
-    finally:
-        if 'cur' in locals():
-            cur.close()
-        if conn:
-            conn.close()
 
 @app.route('/delete_account', methods=['POST'])
 @limiter.limit("5 per minute")
-@route_manager.monitor(
-    route='/delete_account',
-    required_params={
-        'POST': {
-            'account_id': str
-        }
-    },
-    description="Delete an account and all its client associations"
-)
+@route_manager.monitor(name='delete_account')
 def delete_account():
     """Delete an account and all its client associations"""
-    conn = None
     try:
         account_id = request.form.get('account_id')
         
@@ -871,146 +529,91 @@ def delete_account():
             flash('Account ID is required', 'danger')
             return redirect(url_for('index'))
         
-        conn = get_db()
-        cur = conn.cursor()
+        # Delete account-client relationships first
+        supabase.table('account_clients').delete().eq('account_id', account_id).execute()
         
-        # Delete the account (client_accounts will be deleted automatically due to ON DELETE CASCADE)
-        cur.execute('DELETE FROM accounts WHERE id = %s', (account_id,))
+        # Delete the account
+        result = supabase.table('accounts').delete().eq('id', account_id).execute()
         
-        if cur.rowcount == 0:
-            flash('Account not found', 'danger')
-        else:
-            conn.commit()
+        if result.data:
             flash('Account deleted successfully', 'success')
+        else:
+            flash('Account not found', 'danger')
         
     except Exception as e:
         logger.error(f"Error deleting account: {e}")
         flash('Error deleting account', 'danger')
-        if conn:
-            conn.rollback()
-    finally:
-        if 'cur' in locals():
-            cur.close()
-        if conn:
-            conn.close()
     
     return redirect(url_for('index'))
 
 @app.route('/clients')
-@route_manager.monitor(
-    route='/clients',
-    description="Get list of all clients"
-)
+@route_manager.monitor(name='get_clients')
 def get_clients():
-    """Get list of all clients"""
-    # Check if JSON response is requested
-    want_json = (
-        request.headers.get('Accept', '').find('application/json') != -1 or
-        request.args.get('format') == 'json'
-    )
-
-    conn = None
+    """Get all clients with optional JSON response"""
     try:
-        conn = check_db_connection()
-        cur = conn.cursor()
+        want_json = request.args.get('format') == 'json'
         
-        # Get all clients with their account counts
-        cur.execute('''
-            SELECT 
-                c.id, 
-                c.name, 
-                c.email, 
-                COALESCE(c.phone, 'N/A') as phone,
-                COALESCE(to_char(c.renewal_date, 'YYYY-MM-DD'), 'N/A') as renewal_date,
-                COALESCE(to_char(c.next_renewal_date, 'YYYY-MM-DD'), 'N/A') as next_renewal_date,
-                COALESCE(to_char(c.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'), 'N/A') as created_at,
-                COUNT(ca.account_id) as account_count
-            FROM clients c
-            LEFT JOIN client_accounts ca ON c.id = ca.client_id
-            GROUP BY 
-                c.id, 
-                c.name, 
-                c.email, 
-                c.phone, 
-                c.renewal_date,
-                c.next_renewal_date,
-                c.created_at
-            ORDER BY c.name
-        ''')
-        clients = cur.fetchall()
+        # Fetch clients with their associated accounts
+        clients_response = supabase.table('clients').select(
+            '*',
+            count='exact'
+        ).execute()
         
-        # Format the results
+        if not clients_response.data:
+            if want_json:
+                return jsonify({
+                    'status': 'success',
+                    'count': 0,
+                    'clients': []
+                })
+            else:
+                return render_template('clients.html', clients=[])
+                
+        # Format client data
         formatted_clients = []
-        for client in clients:
-            formatted_clients.append({
-                'id': client[0],
-                'name': client[1],
-                'email': client[2],
-                'phone': client[3],
-                'renewal_date': client[4],
-                'next_renewal_date': client[5],
-                'created_at': client[6],
-                'account_count': client[7]
-            })
-        
-        if want_json:
-            return jsonify({
-                'status': 'success',
-                'clients': formatted_clients
-            })
-        else:
-            return render_template('clients.html', clients=formatted_clients, initial_data={
-                'status': 'success',
-                'clients': formatted_clients
-            })
-        
-    except psycopg2.OperationalError as e:
-        logger.error(f"Database connection error in get_clients: {e}")
-        health_checker.check_database(force=True)  # Force health check update
-        if want_json:
-            return jsonify({
-                'status': 'error',
-                'message': 'Database connection error',
-                'error': str(e)
-            }), 503
-        else:
-            flash('Database connection error. Please try again later.', 'danger')
-            return render_template('clients.html', clients=[], db_error=True)
+        for client in clients_response.data:
+            # Get associated accounts for each client
+            relations = supabase.table('account_clients').select(
+                'account_id'
+            ).eq('client_id', client['id']).execute()
             
-    except psycopg2.Error as e:
-        logger.error(f"Database error in get_clients: {e}")
+            account_ids = [r['account_id'] for r in relations.data]
+            accounts = []
+            if account_ids:
+                accounts_response = supabase.table('accounts').select(
+                    'email'
+                ).in_('id', account_ids).execute()
+                accounts = [a['email'] for a in accounts_response.data]
+            
+            formatted_clients.append({
+                'id': client['id'],
+                'name': client['name'],
+                'email': client['email'],
+                'status': client['status'],
+                'renewal_date': client['renewal_date'],
+                'accounts': accounts
+            })
+            
         if want_json:
             return jsonify({
-                'status': 'error',
-                'message': 'Database error',
-                'error': str(e)
-            }), 500
+                'status': 'success',
+                'count': len(formatted_clients),
+                'clients': formatted_clients
+            })
         else:
-            flash('Database error. Please try again later.', 'danger')
-            return render_template('clients.html', clients=[])
+            return render_template('clients.html', clients=formatted_clients)
             
     except Exception as e:
-        logger.error(f"Unexpected error in get_clients: {e}", exc_info=True)
+        logger.error(f"Error in get_clients: {e}")
         if want_json:
             return jsonify({
                 'status': 'error',
-                'message': 'Error fetching clients',
+                'message': 'Internal server error',
                 'error': str(e)
             }), 500
         else:
-            flash('Error fetching clients: ' + str(e), 'danger')
+            flash('Error fetching clients. Please try again later.', 'danger')
             return render_template('clients.html', clients=[])
-    finally:
-        if 'cur' in locals():
-            try:
-                cur.close()
-            except Exception as e:
-                logger.error(f"Error closing cursor: {e}")
-        if conn:
-            try:
-                conn.close()
-            except Exception as e:
-                logger.error(f"Error closing connection: {e}")
 
 # Error handlers
 @app.errorhandler(404)
@@ -1036,39 +639,41 @@ def internal_error(error):
     logger.error(f"Internal server error: {error}")
     return jsonify(error_context), 500
 
-@app.errorhandler(psycopg2.OperationalError)
+# Remove psycopg2 error handler and replace with general database error handler
+@app.errorhandler(Exception)
 def handle_db_error(error):
-    """Handle database connection errors"""
-    logger.error(f"Database error: {error}")
+    """Handle database and other errors"""
+    logger.error(f"Application error: {error}")
     db_status = health_checker.check_database(force=True)
     
-    error_context = {
-        'error': 'Database connection error',
-        'status_code': 503,
-        'timestamp': datetime.now().isoformat(),
-        'db_status': db_status['status'],
-        'retry_after': 60  # Suggest retry after 1 minute
-    }
+    # Check if it's a database-related error
+    if 'database' in str(error).lower() or 'supabase' in str(error).lower():
+        error_context = {
+            'error': 'Database connection error',
+            'status_code': 503,
+            'timestamp': datetime.now().isoformat(),
+            'db_status': db_status['status'],
+            'retry_after': 60  # Suggest retry after 1 minute
+        }
+        
+        response = jsonify(error_context)
+        response.status_code = 503
+        response.headers['Retry-After'] = '60'
+        return response
     
-    response = jsonify(error_context)
-    response.status_code = 503
-    response.headers['Retry-After'] = '60'
-    return response
+    # For other errors, return 500
+    return jsonify({
+        'error': str(error),
+        'status_code': 500,
+        'timestamp': datetime.now().isoformat()
+    }), 500
 
 if __name__ == '__main__':
-    # Initialize database and check health before starting
-    try:
-        init_db()
-        with app.app_context():
-            initial_health = health_checker.check_application()
-            if initial_health['status'] != 'healthy':
-                logger.warning("Application started with unhealthy status")
-                logger.warning(f"Health check results: {initial_health}")
-    except Exception as e:
-        logger.error(f"Error during startup: {e}")
-        raise
+    # Check application health before starting
+    with app.app_context():
+        initial_health = health_checker.check_application()
+        if initial_health['status'] != 'healthy':
+            logger.warning("Application started with unhealthy status")
+            logger.warning(f"Health check results: {initial_health}")
     
-    try:
-        app.run(debug=True)
-    finally:
-        DatabasePool.close_pool()  # Close all connections when the app stops 
+    app.run(debug=True) 

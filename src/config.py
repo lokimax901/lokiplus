@@ -10,16 +10,16 @@ SUPABASE_URL = os.getenv('SUPABASE_URL')
 SUPABASE_KEY = os.getenv('SUPABASE_KEY')
 
 # Initialize Supabase client
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 class Config:
     """Application configuration."""
     DB_CONFIG = {
-        'database': 'postgres',
+        'dbname': 'postgres',
         'user': 'postgres',
-        'password': '%lYXB2QTupE',
+        'password': 'postgres',  # Default Supabase password
         'host': 'db.nusligglyvgsmuvauyce.supabase.co',
-        'port': 5432
+        'port': '5432'
     }
     
     # Flask configuration
@@ -42,5 +42,10 @@ class Config:
     
     @classmethod
     def get_db_connection_string(cls):
+        """Returns the database connection parameters"""
+        return cls.DB_CONFIG
+
+    @classmethod
+    def get_db_connection_string_full(cls):
         """Returns the database connection string"""
-        return f"postgresql://{cls.DB_CONFIG['user']}:{cls.DB_CONFIG['password']}@{cls.DB_CONFIG['host']}:{cls.DB_CONFIG['port']}/{cls.DB_CONFIG['database']}" 
+        return f"postgresql://{cls.DB_CONFIG['user']}:{cls.DB_CONFIG['password']}@{cls.DB_CONFIG['host']}:{cls.DB_CONFIG['port']}/{cls.DB_CONFIG['dbname']}" 
