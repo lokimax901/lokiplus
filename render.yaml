@@ -2,8 +2,9 @@ services:
   - type: web
     name: lokiplus-api
     env: python
+    region: ohio  # Choose a region close to your users
     buildCommand: pip install -r requirements.txt
-    startCommand: cd src && gunicorn app:app
+    startCommand: cd src && gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
@@ -12,10 +13,16 @@ services:
       - key: FLASK_DEBUG
         value: 0
       - key: SUPABASE_URL
-        sync: false
+        value: https://nusligglyvgsmuvauyce.supabase.co
       - key: SUPABASE_KEY
         sync: false
+      - key: FLASK_SECRET_KEY
+        sync: false
       - key: PYTHONPATH
-        value: .
+        value: src
     healthCheckPath: /health
-    autoDeploy: true 
+    healthCheckTimeout: 100
+    autoDeploy: true
+    numInstances: 1
+    domains:
+      - lokiplus-api.onrender.com 
